@@ -1,0 +1,250 @@
+import json
+import sys
+import requests
+from bs4 import BeautifulSoup
+from urllib.parse import urljoin
+from playwright.sync_api import sync_playwright
+
+
+
+URL = {{ url | tojson }}
+
+ITEM_SELECTOR = {{ item_selector | tojson }}
+
+TITLE_SELECTOR = {{ title_selector | tojson if title_selector else "None" }}
+
+LINK_SELECTOR = {{ link_selector | tojson if link_selector else "None" }}
+
+DATE_SELECTOR = {{ date_selector | tojson if date_selector else "None" }}
+
+DESCRIPTION_SELECTOR = {{ description_selector | tojson if description_selector else "None" }}
+
+IMAGE_SELECTOR = {{ image_selector | tojson if image_selector else "None" }}
+
+AUTHOR_SELECTOR = {{ author_selector | tojson if author_selector else "None" }}
+
+CATEGORY_SELECTOR = {{ category_selector | tojson if category_selector else "None" }}
+
+PAGINATION_SELECTOR = {{ pagination_selector | tojson if pagination_selector else "None" }}
+
+MAX_ITEMS = {{ max_items if max_items is not none else "None" }}
+
+RENDERING_MODE = {{ rendering_mode | tojson }}
+
+
+def fetch_html(url):
+    if RENDERING_MODE == "js":
+        with sync_playwright() as playwright:
+
+            browser = playwright.chromium.launch(
+                headless=True
+            )
+
+            page = browser.new_page()
+
+            try:
+                page.goto(
+                    url,
+                    wait_until="networkidle",
+                    timeout=30000
+                )
+
+                return page.content()
+
+            finally:
+                browser.close()
+
+    import urllib3
+    urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+
+    response = requests.get(
+        url,
+        headers={
+            "User-Agent": "Mozilla/5.0 RSS-Xtract/1.0"
+        },
+        timeout=20,
+        verify=False
+    )
+
+    response.raise_for_status()
+
+    return response.text
+
+
+def extract_text(element):
+    if element is None:
+        return None
+
+    return element.get_text(" ", strip=True)
+
+
+def extract_attribute(element, attribute):
+    if element is None:
+        return None
+
+    return element.get(attribute)
+
+
+def extract_articles(html):
+    soup = BeautifulSoup(html, "lxml")
+    articles = []
+    items = soup.select(ITEM_SELECTOR)
+
+    for item in items:
+        titles = item.select(TITLE_SELECTOR) if TITLE_SELECTOR else []
+        
+        # If there are multiple titles within a single item block, the user probably selected a wrapper.
+        # We will zip all extracted arrays together by index to form multiple articles.
+        if len(titles) > 1:
+            links = item.select(LINK_SELECTOR) if LINK_SELECTOR else []
+            dates = item.select(DATE_SELECTOR) if DATE_SELECTOR else []
+            descriptions = item.select(DESCRIPTION_SELECTOR) if DESCRIPTION_SELECTOR else []
+            images = item.select(IMAGE_SELECTOR) if IMAGE_SELECTOR else []
+            authors = item.select(AUTHOR_SELECTOR) if AUTHOR_SELECTOR else []
+            categories = item.select(CATEGORY_SELECTOR) if CATEGORY_SELECTOR else []
+            
+            for i in range(len(titles)):
+                title_el = titles[i]
+                link_el = links[i] if i < len(links) else None
+                date_el = dates[i] if i < len(dates) else None
+                desc_el = descriptions[i] if i < len(descriptions) else None
+                img_el = images[i] if i < len(images) else None
+                auth_el = authors[i] if i < len(authors) else None
+                cat_el = categories[i] if i < len(categories) else None
+                
+                link = extract_attribute(link_el, "href") if link_el else None
+                image = extract_attribute(img_el, "src") if img_el else None
+                
+                articles.append({
+                    "title": extract_text(title_el),
+                    "link": link,
+                    "date": extract_text(date_el),
+                    "description": extract_text(desc_el),
+                    "image": image,
+                    "author": extract_text(auth_el),
+                    "category": extract_text(cat_el),
+                })
+        else:
+            # Standard extraction (boundary is the actual row)
+            title_element = item.select_one(TITLE_SELECTOR) if TITLE_SELECTOR else None
+            link_element = item.select_one(LINK_SELECTOR) if LINK_SELECTOR else None
+            date_element = item.select_one(DATE_SELECTOR) if DATE_SELECTOR else None
+            description_element = item.select_one(DESCRIPTION_SELECTOR) if DESCRIPTION_SELECTOR else None
+            image_element = item.select_one(IMAGE_SELECTOR) if IMAGE_SELECTOR else None
+            author_element = item.select_one(AUTHOR_SELECTOR) if AUTHOR_SELECTOR else None
+            category_element = item.select_one(CATEGORY_SELECTOR) if CATEGORY_SELECTOR else None
+
+            link = (
+                extract_attribute(link_element, "href")
+                if link_element is not None
+                else (extract_attribute(item, "href") if item.name == "a" else None)
+            )
+
+            image = (
+                extract_attribute(image_element, "src")
+                if image_element is not None
+                else (extract_attribute(item, "src") if item.name == "img" else None)
+            )
+
+            articles.append({
+                "title": extract_text(title_element),
+                "link": link,
+                "date": extract_text(date_element),
+                "description": extract_text(description_element),
+                "image": image,
+                "author": extract_text(author_element),
+                "category": extract_text(category_element),
+            })
+
+    return articles, soup
+
+
+def get_next_url(soup, current_url):
+    if not PAGINATION_SELECTOR:
+        return None
+
+    next_element = soup.select_one(
+        PAGINATION_SELECTOR
+    )
+
+    if next_element is None:
+        return None
+
+    next_href = next_element.get("href")
+
+    if not next_href:
+        return None
+
+    return urljoin(
+        current_url,
+        next_href
+    )
+
+
+def scrape():
+    articles = []
+
+    current_url = URL
+
+    MAX_PAGES = 500
+    page_count = 0
+
+    visited_urls = set()
+
+    max_target_str = str(MAX_ITEMS) if MAX_ITEMS is not None else "All"
+
+    while current_url and page_count < MAX_PAGES:
+
+        if current_url in visited_urls:
+            break
+
+        visited_urls.add(current_url)
+
+        html = fetch_html(current_url)
+
+        page_articles, soup = extract_articles(
+            html
+        )
+
+        found_count = len(page_articles)
+
+        for article in page_articles:
+            articles.append(article)
+            if MAX_ITEMS is not None and len(articles) >= MAX_ITEMS:
+                break
+
+        page_number = page_count + 1
+
+        sys.stderr.write(f"Page {page_number}: found {found_count} articles\n")
+        sys.stderr.write(f"Total collected: {len(articles)}/{max_target_str}\n\n")
+        sys.stderr.flush()
+
+        if MAX_ITEMS is not None and len(articles) >= MAX_ITEMS:
+            sys.stderr.write("Maximum item limit reached. Stopping pagination.\n")
+            sys.stderr.flush()
+            break
+
+        next_url = get_next_url(
+            soup,
+            current_url
+        )
+
+        if not next_url:
+            break
+
+        current_url = next_url
+        page_count += 1
+
+    return articles
+
+
+if __name__ == "__main__":
+    articles = scrape()
+
+    print(
+        json.dumps(
+            articles,
+            indent=2,
+            ensure_ascii=False
+        )
+    )

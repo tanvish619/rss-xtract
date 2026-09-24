@@ -1,0 +1,25 @@
+# Web framework
+fastapi
+uvicorn[standard]
+
+# Database
+sqlalchemy
+alembic
+psycopg2-binary
+
+# Task queue
+celery
+redis
+
+# HTTP & scraping
+httpx
+beautifulsoup4
+playwright
+certifi
+
+# Templating
+jinja2
+
+# Validation
+pydantic
+pydantic-settings
