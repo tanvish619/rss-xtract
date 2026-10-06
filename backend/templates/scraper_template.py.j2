@@ -1,11 +1,9 @@
 import json
 import sys
-import requests
-from bs4 import BeautifulSoup
+import re
 from urllib.parse import urljoin
-from playwright.sync_api import sync_playwright
-
-
+import httpx
+from bs4 import BeautifulSoup
 
 URL = {{ url | tojson }}
 
@@ -31,129 +29,379 @@ MAX_ITEMS = {{ max_items if max_items is not none else "None" }}
 
 RENDERING_MODE = {{ rendering_mode | tojson }}
 
+HEADERS = {
+    "User-Agent": (
+        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) "
+        "Chrome/124.0.0.0 Safari/537.36"
+    ),
+    "Accept": (
+        "text/html,application/xhtml+xml,application/xml;q=0.9,"
+        "image/avif,image/webp,image/apng,*/*;q=0.8"
+    ),
+    "Accept-Language": "en-US,en;q=0.9",
+    "Sec-Ch-Ua": '"Chromium";v="124", "Google Chrome";v="124", "Not-A.Brand";v="99"',
+    "Sec-Ch-Ua-Mobile": "?0",
+    "Sec-Ch-Ua-Platform": '"macOS"',
+    "Sec-Fetch-Dest": "document",
+    "Sec-Fetch-Mode": "navigate",
+    "Sec-Fetch-Site": "none",
+    "Sec-Fetch-User": "?1",
+    "Upgrade-Insecure-Requests": "1",
+}
+
+
+def fetch_with_playwright(url):
+    from playwright.sync_api import sync_playwright
+
+    with sync_playwright() as playwright:
+        browser = playwright.chromium.launch(
+            headless=True,
+            args=[
+                "--disable-blink-features=AutomationControlled",
+                "--no-sandbox",
+                "--disable-setuid-sandbox",
+                "--disable-dev-shm-usage",
+                "--disable-web-security",
+                "--ignore-certificate-errors",
+            ],
+        )
+
+        context = browser.new_context(
+            user_agent=HEADERS["User-Agent"],
+            viewport={"width": 1920, "height": 1080},
+            locale="en-GB",
+            ignore_https_errors=True,
+            java_script_enabled=True,
+            extra_http_headers={
+                "Accept-Language": "en-GB,en-US;q=0.9,en;q=0.8",
+                "Sec-Ch-Ua": '"Chromium";v="124", "Google Chrome";v="124", "Not-A.Brand";v="99"',
+                "Sec-Ch-Ua-Mobile": "?0",
+                "Sec-Ch-Ua-Platform": '"macOS"',
+                "Upgrade-Insecure-Requests": "1",
+            },
+        )
+
+        page = context.new_page()
+        page.add_init_script(
+            """
+            delete navigator.__proto__.webdriver;
+            Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
+            window.navigator.chrome = { runtime: {} };
+            Object.defineProperty(navigator, 'languages', { get: () => ['en-GB', 'en-US', 'en'] });
+            Object.defineProperty(navigator, 'plugins', { get: () => [1, 2, 3, 4, 5] });
+            """
+        )
+
+        try:
+            try:
+                page.goto(url, wait_until="networkidle", timeout=20000)
+            except Exception:
+                try:
+                    page.goto(url, wait_until="domcontentloaded", timeout=25000)
+                except Exception:
+                    pass
+
+            try:
+                page.wait_for_timeout(1000)
+            except Exception:
+                pass
+
+            # Auto-dismiss cookie dialog if visible
+            for selector in [
+                "#onetrust-accept-btn-handler",
+                "#accept-cookies",
+                ".cookie-accept",
+                "button[id*='cookie'][id*='accept']",
+                "button:has-text('Accept All')",
+                "button:has-text('Accept all')",
+            ]:
+                try:
+                    btn = page.query_selector(selector)
+                    if btn and btn.is_visible():
+                        btn.click(timeout=1000)
+                        page.wait_for_timeout(500)
+                        break
+                except Exception:
+                    continue
+
+            # Wait for dynamic cards or items to populate
+            dynamic_selectors = [
+                ITEM_SELECTOR,
+                "a.filterable-results-total-result",
+                "[class*='filterable-results-total-result']",
+                "main article",
+                "article",
+                "li.card-article",
+                "li.theme-selector-content__item",
+                "div.c-company-news-list__wrap",
+                "article.ei_cardboarditem",
+                "[class*='press-release']",
+                "[class*='news-item']",
+            ]
+
+            max_checks = 20
+            stable_checks = 0
+            populated_checks = 0
+            prev_len = -1
+
+            for check_idx in range(max_checks):
+                try:
+                    has_cards = False
+                    for d_sel in dynamic_selectors:
+                        try:
+                            if not d_sel:
+                                continue
+                            substantive_count = page.evaluate(
+                                """(selector) => {
+                                const els = document.querySelectorAll(selector);
+                                let count = 0;
+                                for (const el of els) {
+                                    if (el.closest('header, nav, footer, .header, .footer, .nav, .menu')) continue;
+                                    const txt = (el.innerText || el.textContent || '').trim();
+                                    if (txt.length >= 20) count++;
+                                }
+                                return count;
+                            }""",
+                                d_sel,
+                            )
+                            if substantive_count >= 2:
+                                has_cards = True
+                                break
+                        except Exception:
+                            continue
+
+                    cur_len = page.evaluate("() => document.documentElement.outerHTML.length")
+                    if cur_len == prev_len:
+                        stable_checks += 1
+                    else:
+                        stable_checks = 0
+
+                    if has_cards:
+                        populated_checks += 1
+
+                    prev_len = cur_len
+
+                    if populated_checks >= 2:
+                        break
+                    if check_idx >= 10 and stable_checks >= 4:
+                        break
+                except Exception:
+                    break
+
+                page.wait_for_timeout(500)
+
+            return page.content()
+
+        finally:
+            try:
+                page.close()
+            except Exception:
+                pass
+            try:
+                context.close()
+            except Exception:
+                pass
+            try:
+                browser.close()
+            except Exception:
+                pass
+
 
 def fetch_html(url):
     if RENDERING_MODE == "js":
-        with sync_playwright() as playwright:
+        return fetch_with_playwright(url)
 
-            browser = playwright.chromium.launch(
-                headless=True
-            )
-
-            page = browser.new_page()
+    try:
+        with httpx.Client(
+            headers=HEADERS,
+            timeout=25,
+            follow_redirects=True,
+            verify=False,
+        ) as client:
+            response = client.get(url)
 
             try:
-                page.goto(
-                    url,
-                    wait_until="networkidle",
-                    timeout=30000
-                )
+                body_text = response.text
+            except Exception:
+                encoding = response.encoding or "utf-8"
+                try:
+                    body_text = response.content.decode(encoding, errors="replace")
+                except Exception:
+                    body_text = response.content.decode("utf-8", errors="replace")
 
-                return page.content()
+            # Check for 403 or anti-bot challenge or Akamai error 1007
+            blocked_markers = [
+                "access denied", "cloudflare", "just a moment",
+                "error 1007", "we are sorry an error has occurred"
+            ]
+            if response.status_code in (401, 403, 404, 429, 503) or any(
+                w in body_text[:50000].lower()
+                for w in blocked_markers
+            ):
+                sys.stderr.write(f"HTTP status {response.status_code} or challenge received. Falling back to browser.\n")
+                return fetch_with_playwright(url)
 
-            finally:
-                browser.close()
+            response.raise_for_status()
+            return body_text
 
-    import urllib3
-    urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+    except Exception as e:
+        sys.stderr.write(f"HTTP fetch failed ({e}). Falling back to browser.\n")
+        return fetch_with_playwright(url)
 
-    response = requests.get(
-        url,
-        headers={
-            "User-Agent": "Mozilla/5.0 RSS-Xtract/1.0"
-        },
-        timeout=20,
-        verify=False
+
+def clean_text(element):
+    if element is None:
+        return None
+    text = element.get_text(" ", strip=True) if hasattr(element, "get_text") else str(element).strip()
+    text = re.sub(r"\s+", " ", text).strip()
+    return text if text else None
+
+
+def is_valid_href(href):
+    if not href or not isinstance(href, str):
+        return False
+    h = href.strip().lower()
+    if h.startswith("javascript:") or h.startswith("#") or h.startswith("mailto:") or h.startswith("tel:"):
+        return False
+    return len(h) > 0
+
+
+def extract_link(element, item, base_url):
+    raw_link = None
+
+    if element is not None:
+        if element.name == "a" and is_valid_href(element.get("href")):
+            raw_link = element.get("href")
+        elif is_valid_href(element.get("data-href") or element.get("data-url") or element.get("data-link")):
+            raw_link = element.get("data-href") or element.get("data-url") or element.get("data-link")
+        else:
+            # Check child <a>
+            for a in element.find_all("a", href=True):
+                if is_valid_href(a.get("href")):
+                    raw_link = a.get("href")
+                    break
+            
+            # Check parent <a>
+            if not raw_link:
+                parent_a = element.find_parent("a", href=True)
+                if parent_a and is_valid_href(parent_a.get("href")):
+                    raw_link = parent_a.get("href")
+
+    # If still no valid link, scan item container
+    if not raw_link and item is not None:
+        if item.name == "a" and is_valid_href(item.get("href")):
+            raw_link = item.get("href")
+        elif is_valid_href(item.get("data-href") or item.get("data-url") or item.get("data-link")):
+            raw_link = item.get("data-href") or item.get("data-url") or item.get("data-link")
+        else:
+            for a in item.find_all("a", href=True):
+                if is_valid_href(a.get("href")):
+                    raw_link = a.get("href")
+                    break
+
+        if not raw_link:
+            parent_a = item.find_parent("a", href=True)
+            if parent_a and is_valid_href(parent_a.get("href")):
+                raw_link = parent_a.get("href")
+
+    if raw_link:
+        raw_link = raw_link.strip()
+        return urljoin(base_url, raw_link)
+
+    return None
+
+
+def extract_image(element, item, base_url):
+    img_src = None
+
+    def find_src_in_tag(tag):
+        if not tag:
+            return None
+        src = (
+            tag.get("src")
+            or tag.get("data-src")
+            or tag.get("data-original")
+            or tag.get("data-lazy-src")
+            or tag.get("data-fallback-src")
+        )
+        if not src and tag.get("srcset"):
+            src = tag.get("srcset").split(",")[0].strip().split(" ")[0]
+        if not src and tag.get("style"):
+            m = re.search(r"url\(['\"]?(.*?)['\"]?\)", tag.get("style"))
+            if m:
+                src = m.group(1)
+        return src
+
+    if element is not None:
+        img_src = find_src_in_tag(element)
+        if not img_src and element.name != "img":
+            img_tag = element.find("img")
+            if img_tag:
+                img_src = find_src_in_tag(img_tag)
+
+    if not img_src and item is not None:
+        img_tag = item.find("img")
+        if img_tag:
+            img_src = find_src_in_tag(img_tag)
+        else:
+            img_src = find_src_in_tag(item)
+
+    if img_src:
+        img_src = img_src.strip()
+        if not img_src.startswith("data:"):
+            return urljoin(base_url, img_src)
+
+    return None
+
+
+def extract_date(element):
+    if element is None:
+        return None
+    date_val = (
+        element.get("datetime")
+        or element.get("data-date")
+        or element.get("data-time")
+        or element.get("data-publish-date")
+        or clean_text(element)
     )
-
-    response.raise_for_status()
-
-    return response.text
+    return str(date_val).strip() if date_val else None
 
 
-def extract_text(element):
-    if element is None:
-        return None
-
-    return element.get_text(" ", strip=True)
-
-
-def extract_attribute(element, attribute):
-    if element is None:
-        return None
-
-    return element.get(attribute)
-
-
-def extract_articles(html):
-    soup = BeautifulSoup(html, "lxml")
+def extract_articles(html, current_url):
+    soup = BeautifulSoup(html, "html.parser")
     articles = []
     items = soup.select(ITEM_SELECTOR)
 
     for item in items:
-        titles = item.select(TITLE_SELECTOR) if TITLE_SELECTOR else []
-        
-        # If there are multiple titles within a single item block, the user probably selected a wrapper.
-        # We will zip all extracted arrays together by index to form multiple articles.
-        if len(titles) > 1:
-            links = item.select(LINK_SELECTOR) if LINK_SELECTOR else []
-            dates = item.select(DATE_SELECTOR) if DATE_SELECTOR else []
-            descriptions = item.select(DESCRIPTION_SELECTOR) if DESCRIPTION_SELECTOR else []
-            images = item.select(IMAGE_SELECTOR) if IMAGE_SELECTOR else []
-            authors = item.select(AUTHOR_SELECTOR) if AUTHOR_SELECTOR else []
-            categories = item.select(CATEGORY_SELECTOR) if CATEGORY_SELECTOR else []
-            
-            for i in range(len(titles)):
-                title_el = titles[i]
-                link_el = links[i] if i < len(links) else None
-                date_el = dates[i] if i < len(dates) else None
-                desc_el = descriptions[i] if i < len(descriptions) else None
-                img_el = images[i] if i < len(images) else None
-                auth_el = authors[i] if i < len(authors) else None
-                cat_el = categories[i] if i < len(categories) else None
-                
-                link = extract_attribute(link_el, "href") if link_el else None
-                image = extract_attribute(img_el, "src") if img_el else None
-                
-                articles.append({
-                    "title": extract_text(title_el),
-                    "link": link,
-                    "date": extract_text(date_el),
-                    "description": extract_text(desc_el),
-                    "image": image,
-                    "author": extract_text(auth_el),
-                    "category": extract_text(cat_el),
-                })
-        else:
-            # Standard extraction (boundary is the actual row)
-            title_element = item.select_one(TITLE_SELECTOR) if TITLE_SELECTOR else None
-            link_element = item.select_one(LINK_SELECTOR) if LINK_SELECTOR else None
-            date_element = item.select_one(DATE_SELECTOR) if DATE_SELECTOR else None
-            description_element = item.select_one(DESCRIPTION_SELECTOR) if DESCRIPTION_SELECTOR else None
-            image_element = item.select_one(IMAGE_SELECTOR) if IMAGE_SELECTOR else None
-            author_element = item.select_one(AUTHOR_SELECTOR) if AUTHOR_SELECTOR else None
-            category_element = item.select_one(CATEGORY_SELECTOR) if CATEGORY_SELECTOR else None
+        title_element = item.select_one(TITLE_SELECTOR) if TITLE_SELECTOR else None
+        link_element = item.select_one(LINK_SELECTOR) if LINK_SELECTOR else None
+        date_element = item.select_one(DATE_SELECTOR) if DATE_SELECTOR else None
+        description_element = item.select_one(DESCRIPTION_SELECTOR) if DESCRIPTION_SELECTOR else None
+        image_element = item.select_one(IMAGE_SELECTOR) if IMAGE_SELECTOR else None
+        author_element = item.select_one(AUTHOR_SELECTOR) if AUTHOR_SELECTOR else None
+        category_element = item.select_one(CATEGORY_SELECTOR) if CATEGORY_SELECTOR else None
 
-            link = (
-                extract_attribute(link_element, "href")
-                if link_element is not None
-                else (extract_attribute(item, "href") if item.name == "a" else None)
-            )
+        # Fallback for title: search heading or main link text if title_element not matched
+        if not title_element:
+            heading = item.find(["h1", "h2", "h3", "h4", "h5", "h6"])
+            if heading:
+                title_element = heading
+            elif link_element and clean_text(link_element):
+                title_element = link_element
 
-            image = (
-                extract_attribute(image_element, "src")
-                if image_element is not None
-                else (extract_attribute(item, "src") if item.name == "img" else None)
-            )
+        t_text = clean_text(title_element) if title_element else clean_text(item)
+        link = extract_link(link_element or title_element, item, current_url)
 
+        if t_text or link:
             articles.append({
-                "title": extract_text(title_element),
+                "title": t_text,
                 "link": link,
-                "date": extract_text(date_element),
-                "description": extract_text(description_element),
-                "image": image,
-                "author": extract_text(author_element),
-                "category": extract_text(category_element),
+                "date": extract_date(date_element),
+                "description": clean_text(description_element),
+                "image": extract_image(image_element, item, current_url),
+                "author": clean_text(author_element),
+                "category": clean_text(category_element),
             })
 
     return articles, soup
@@ -163,59 +411,61 @@ def get_next_url(soup, current_url):
     if not PAGINATION_SELECTOR:
         return None
 
-    next_element = soup.select_one(
-        PAGINATION_SELECTOR
-    )
-
+    next_element = soup.select_one(PAGINATION_SELECTOR)
     if next_element is None:
         return None
 
     next_href = next_element.get("href")
-
-    if not next_href:
+    if not next_href or next_href.startswith("#") or next_href.startswith("javascript:"):
         return None
 
-    return urljoin(
-        current_url,
-        next_href
-    )
+    full_next_url = urljoin(current_url, next_href.strip())
+    if full_next_url == current_url:
+        return None
+
+    return full_next_url
 
 
 def scrape():
     articles = []
-
     current_url = URL
-
-    MAX_PAGES = 500
+    MAX_PAGES = 50
     page_count = 0
-
     visited_urls = set()
+    seen_article_links = set()
 
     max_target_str = str(MAX_ITEMS) if MAX_ITEMS is not None else "All"
 
     while current_url and page_count < MAX_PAGES:
-
         if current_url in visited_urls:
             break
-
         visited_urls.add(current_url)
 
         html = fetch_html(current_url)
+        page_articles, soup = extract_articles(html, current_url)
 
-        page_articles, soup = extract_articles(
-            html
-        )
+        # If HTTP returned 0 articles on page 1, automatically try browser rendering
+        if not page_articles and RENDERING_MODE != "js" and page_count == 0:
+            sys.stderr.write("0 articles found via HTTP. Retrying with Playwright...\n")
+            html = fetch_with_playwright(current_url)
+            page_articles, soup = extract_articles(html, current_url)
 
-        found_count = len(page_articles)
-
+        new_on_page = 0
         for article in page_articles:
+            link = article.get("link")
+            if link:
+                if link in seen_article_links:
+                    continue
+                seen_article_links.add(link)
+
             articles.append(article)
+            new_on_page += 1
+
             if MAX_ITEMS is not None and len(articles) >= MAX_ITEMS:
                 break
 
         page_number = page_count + 1
-
-        sys.stderr.write(f"Page {page_number}: found {found_count} articles\n")
+        sys.stderr.write(f"Page {page_number}: found {len(page_articles)} raw ({new_on_page} new) articles\n")
         sys.stderr.write(f"Total collected: {len(articles)}/{max_target_str}\n\n")
         sys.stderr.flush()
 
@@ -224,11 +474,11 @@ def scrape():
             sys.stderr.flush()
             break
 
-        next_url = get_next_url(
-            soup,
-            current_url
-        )
+        if new_on_page == 0 and page_count > 0:
+            # Stop if pagination didn't yield any new articles
+            break
 
+        next_url = get_next_url(soup, current_url)
         if not next_url:
             break
 
@@ -240,7 +490,7 @@ def scrape():
 
 if __name__ == "__main__":
     articles = scrape()
-
+    sys.stdout.reconfigure(encoding="utf-8")
     print(
         json.dumps(
             articles,

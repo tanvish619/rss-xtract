@@ -120,6 +120,9 @@ export default function CreateFeedPage() {
         await previewWebsite(url.trim());
 
       setPreview(result);
+      if (!feedName && result.page_title) {
+        setFeedName(result.page_title.slice(0, 80));
+      }
       setStep(2);
     } catch (err) {
       setError(
@@ -368,13 +371,15 @@ export default function CreateFeedPage() {
                       </label>
 
                       <input
+                        id="feedName"
+                        name="feedName"
                         value={feedName}
                         onChange={(event) =>
                           setFeedName(
                             event.target.value
                           )
                         }
-                        placeholder="My News Feed"
+                        placeholder="Feed Name (e.g. Santander News)"
                         className="w-full rounded-lg border border-gray-700 bg-gray-950 px-4 py-3 text-sm outline-none focus:border-blue-500"
                       />
                     </div>

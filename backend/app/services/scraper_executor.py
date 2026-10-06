@@ -1,4 +1,5 @@
 import json
+import os
 import subprocess
 import sys
 from pathlib import Path
@@ -33,6 +34,9 @@ def execute_scraper(
             f"Scraper file not found: {scraper_path}"
         )
 
+    env = os.environ.copy()
+    env["PYTHONIOENCODING"] = "utf-8"
+
     try:
         result = subprocess.run(
             [
@@ -41,12 +45,13 @@ def execute_scraper(
             ],
             capture_output=True,
             text=True,
-            timeout=60
+            timeout=120,
+            env=env
         )
 
     except subprocess.TimeoutExpired:
         raise RuntimeError(
-            "Scraper execution timed out after 60 seconds"
+            "Scraper execution timed out after 120 seconds"
         )
 
     if result.returncode != 0:

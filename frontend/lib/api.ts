@@ -58,6 +58,7 @@ export async function previewWebsite(
       },
       body: JSON.stringify({
         url,
+        rendering_mode: "js",
       }),
     }
   );

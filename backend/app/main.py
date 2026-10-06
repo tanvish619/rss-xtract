@@ -1,4 +1,4 @@
-﻿from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 
 from app.schemas import WebsiteRequest
@@ -72,11 +72,11 @@ def root():
 def preview_website(
     request: WebsiteRequest
 ):
-
     try:
-
+        rendering_mode = getattr(request, "rendering_mode", "request") or "request"
         html = fetch_page(
-            str(request.url)
+            str(request.url),
+            rendering_mode=rendering_mode
         )
 
         parsed = parse_html(html)
@@ -99,7 +99,6 @@ def preview_website(
         }
 
     except Exception as e:
-
         raise HTTPException(
             status_code=400,
             detail=str(e)
